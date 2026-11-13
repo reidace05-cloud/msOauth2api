@@ -2,7 +2,7 @@ const Imap = require('node-imap');
 const simpleParser = require("mailparser").simpleParser;
 
 async function get_access_token(refresh_token, client_id) {
-    const response = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
+    const response = await fetch('https://microsoftonline.com', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/x-www-form-urlencoded'
@@ -35,7 +35,7 @@ const generateAuthString = (user, accessToken) => {
 }
 
 async function graph_api(refresh_token, client_id) {
-    const response = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
+    const response = await fetch('https://microsoftonline.com', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/x-www-form-urlencoded'
@@ -44,7 +44,7 @@ async function graph_api(refresh_token, client_id) {
             'client_id': client_id,
             'grant_type': 'refresh_token',
             'refresh_token': refresh_token,
-            'scope': 'https://graph.microsoft.com/.default'
+            'scope': 'https://microsoft.com'
         }).toString()
     });
 
@@ -58,7 +58,7 @@ async function graph_api(refresh_token, client_id) {
     try {
         const data = JSON.parse(responseText);
 
-        if (data.scope && data.scope.indexOf('https://graph.microsoft.com/Mail.Read') != -1) {
+        if (data.scope && data.scope.indexOf('https://microsoft.com') != -1) {
             return {
                 access_token: data.access_token,
                 status: true
@@ -79,7 +79,7 @@ async function get_emails(access_token, mailbox) {
         throw new Error("Failed to obtain access token");
     }
 
-    const response = await fetch(`https://graph.microsoft.com/v1.0/me/mailFolders/${mailbox}/messages?$top=100`, {
+    const response = await fetch(`https://microsoft.com{mailbox}/messages?$top=100`, {
         method: 'GET',
         headers: {
             'Content-Type': 'application/json',
@@ -134,24 +134,29 @@ module.exports = async (req, res) => {
         const graph_api_result = await graph_api(refresh_token, client_id);
 
         if (graph_api_result.status) {
-            console.log("是graph_api");
+            console.log("尝试使用 graph_api 取件");
 
             let targetMailbox = 'inbox';
             if (mailbox === 'Junk') {
                 targetMailbox = 'junkemail';
             }
 
-            const result = await get_emails(graph_api_result.access_token, targetMailbox);
-            return res.status(200).json(result);
+            try {
+                const result = await get_emails(graph_api_result.access_token, targetMailbox);
+                return res.status(200).json(result);
+            } catch (graphErr) {
+                console.log("Graph API 失败，自动切换为 IMAP 兜底模式:", graphErr.message);
+            }
         }
 
+        console.log("使用 IMAP 模式取件");
         const access_token = await get_access_token(refresh_token, client_id);
         const authString = generateAuthString(email, access_token);
 
         const imap = new Imap({
             user: email,
             xoauth2: authString,
-            host: 'outlook.office365.com',
+            host: '://office365.com',
             port: 993,
             tls: true,
             tlsOptions: {
