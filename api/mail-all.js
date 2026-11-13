@@ -58,7 +58,7 @@ async function graph_api(refresh_token, client_id) {
     try {
         const data = JSON.parse(responseText);
 
-        if (data.scope.indexOf('https://graph.microsoft.com/Mail.Read') != -1) {
+        if (data.scope && data.scope.indexOf('https://graph.microsoft.com/Mail.Read') != -1) {
             return {
                 access_token: data.access_token,
                 status: true
@@ -75,47 +75,35 @@ async function graph_api(refresh_token, client_id) {
 }
 
 async function get_emails(access_token, mailbox) {
-
     if (!access_token) {
-        console.log("Failed to obtain access token'");
-        return;
+        throw new Error("Failed to obtain access token");
     }
 
-    try {
-        const response = await fetch(`https://graph.microsoft.com/v1.0/me/mailFolders/${mailbox}/messages?$top=10000`, {
-            method: 'GET',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                "Authorization": `Bearer ${access_token}`
-            },
-        });
+    const response = await fetch(`https://graph.microsoft.com/v1.0/me/mailFolders/${mailbox}/messages?$top=100`, {
+        method: 'GET',
+        headers: {
+            'Content-Type': 'application/json',
+            "Authorization": `Bearer ${access_token}`
+        },
+    });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            return
-        }
-
-        const responseData = await response.json();
-
-        const emails = responseData.value;
-
-        const response_emails = emails.map(item => {
-            return {
-                send: item['from']['emailAddress']['address'],
-                subject: item['subject'],
-                text: item['bodyPreview'],
-                html: item['body']['content'],
-                date: item['createdDateTime'],
-            }
-        })
-
-        return response_emails
-
-    } catch (error) {
-        console.error('Error fetching emails:', error);
-        return;
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Graph API error (${response.status}): ${errorText}`);
     }
 
+    const responseData = await response.json();
+    const emails = responseData.value || [];
+
+    return emails.map(item => {
+        return {
+            send: item.from?.emailAddress?.address || '未知发件人',
+            subject: item.subject || '(无主题)',
+            text: item.bodyPreview || '',
+            html: item.body?.content || item.bodyPreview || '',
+            date: item.createdDateTime || '',
+        };
+    });
 }
 
 module.exports = async (req, res) => {
@@ -130,46 +118,31 @@ module.exports = async (req, res) => {
         });
     }
 
-    // 根据请求方法从 query 或 body 中获取参数
     let { refresh_token, client_id, email, mailbox } = req.method === 'GET' ? req.query : req.body;
 
-    // 检查是否缺少必要的参数
     if (!refresh_token || !client_id || !email || !mailbox) {
         return res.status(400).json({ error: 'Missing required parameters: refresh_token, client_id, email, or mailbox' });
     }
 
-    // mailbox 白名单校验:防止 attacker 通过任意 IMAP 文件夹名越权访问
     const ALLOWED_MAILBOXES = ['INBOX', 'Junk'];
     if (!ALLOWED_MAILBOXES.includes(mailbox)) {
         return res.status(400).json({ error: 'Invalid mailbox. Allowed: INBOX, Junk' });
     }
 
     try {
-
         console.log("判断是否graph_api");
-        const graph_api_result = await graph_api(refresh_token, client_id)
+        const graph_api_result = await graph_api(refresh_token, client_id);
 
         if (graph_api_result.status) {
-
             console.log("是graph_api");
 
-            if (mailbox != "INBOX" && mailbox != "Junk") {
-                mailbox = "inbox";
+            let targetMailbox = 'inbox';
+            if (mailbox === 'Junk') {
+                targetMailbox = 'junkemail';
             }
 
-            if (mailbox == 'INBOX') {
-                mailbox = 'inbox';
-            }
-
-            if (mailbox == 'Junk') {
-                mailbox = 'junkemail';
-            }
-
-            const result = await get_emails(graph_api_result.access_token, mailbox);
-
-            res.status(200).json(result);
-
-            return
+            const result = await get_emails(graph_api_result.access_token, targetMailbox);
+            return res.status(200).json(result);
         }
 
         const access_token = await get_access_token(refresh_token, client_id);
@@ -189,7 +162,6 @@ module.exports = async (req, res) => {
         const emailList = [];
         imap.once("ready", async () => {
             try {
-                // 动态打开指定的邮箱（如 INBOX 或 Junk）
                 await new Promise((resolve, reject) => {
                     imap.openBox(mailbox, true, (err, box) => {
                         if (err) return reject(err);
@@ -204,18 +176,23 @@ module.exports = async (req, res) => {
                     });
                 });
 
+                if (!results || results.length === 0) {
+                    imap.end();
+                    return;
+                }
+
                 const f = imap.fetch(results, { bodies: "" });
 
                 f.on("message", (msg, seqno) => {
                     msg.on("body", (stream, info) => {
                         simpleParser(stream, (err, mail) => {
-                            if (err) throw err;
+                            if (err) return;
                             const data = {
-                                send: mail.from.text,
-                                subject: mail.subject,
-                                text: mail.text,
-                                html: mail.html,
-                                date: mail.date,
+                                send: mail.from?.text || '未知发件人',
+                                subject: mail.subject || '(无主题)',
+                                text: mail.text || '',
+                                html: mail.html || '',
+                                date: mail.date || '',
                             };
 
                             emailList.push(data);
@@ -228,17 +205,23 @@ module.exports = async (req, res) => {
                 });
             } catch (err) {
                 imap.end();
-                res.status(500).json({ error: err.message });
+                if (!res.headersSent) {
+                    res.status(500).json({ error: err.message });
+                }
             }
         });
 
         imap.once('error', (err) => {
             console.error('IMAP error:', err);
-            res.status(500).json({ error: err.message });
+            if (!res.headersSent) {
+                res.status(500).json({ error: err.message });
+            }
         });
 
         imap.once('end', () => {
-            res.status(200).json(emailList);
+            if (!res.headersSent) {
+                res.status(200).json(emailList);
+            }
             console.log('IMAP connection ended');
         });
 
@@ -246,6 +229,8 @@ module.exports = async (req, res) => {
 
     } catch (error) {
         console.error('Error:', error);
-        res.status(500).json({ error: error.message });
+        if (!res.headersSent) {
+            res.status(500).json({ error: error.message });
+        }
     }
 };
