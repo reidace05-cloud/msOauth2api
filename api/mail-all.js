@@ -1,12 +1,32 @@
 const Imap = require('node-imap');
 const simpleParser = require("mailparser").simpleParser;
 
+async function fetchWithRetry(url, options, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(url, {
+                ...options,
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    ...(options.headers || {})
+                }
+            });
+            clearTimeout(timeout);
+            return res;
+        } catch (err) {
+            if (i === retries - 1) throw err;
+            await new Promise(r => setTimeout(r, 800));
+        }
+    }
+}
+
 async function get_access_token(refresh_token, client_id) {
-    const response = await fetch('https://microsoftonline.com', {
+    const response = await fetchWithRetry('https://microsoftonline.com', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
             'client_id': client_id,
             'grant_type': 'refresh_token',
@@ -16,17 +36,11 @@ async function get_access_token(refresh_token, client_id) {
 
     if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, response: ${errorText}`);
+        throw new Error(`Token error (${response.status}): ${errorText}`);
     }
 
-    const responseText = await response.text();
-
-    try {
-        const data = JSON.parse(responseText);
-        return data.access_token;
-    } catch (parseError) {
-        throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
-    }
+    const data = await response.json();
+    return data.access_token;
 }
 
 const generateAuthString = (user, accessToken) => {
@@ -35,11 +49,9 @@ const generateAuthString = (user, accessToken) => {
 }
 
 async function graph_api(refresh_token, client_id) {
-    const response = await fetch('https://microsoftonline.com', {
+    const response = await fetchWithRetry('https://microsoftonline.com', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
             'client_id': client_id,
             'grant_type': 'refresh_token',
@@ -50,28 +62,16 @@ async function graph_api(refresh_token, client_id) {
 
     if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, response: ${errorText}`);
+        throw new Error(`Graph token error (${response.status}): ${errorText}`);
     }
 
-    const responseText = await response.text();
+    const data = await response.json();
+    const hasGraphScope = data.scope && data.scope.indexOf('https://microsoft.com') !== -1;
 
-    try {
-        const data = JSON.parse(responseText);
-
-        if (data.scope && data.scope.indexOf('https://microsoft.com') != -1) {
-            return {
-                access_token: data.access_token,
-                status: true
-            }
-        }
-
-        return {
-            access_token: data.access_token,
-            status: false
-        }
-    } catch (parseError) {
-        throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
-    }
+    return {
+        access_token: data.access_token,
+        status: hasGraphScope
+    };
 }
 
 async function get_emails(access_token, mailbox) {
@@ -79,12 +79,12 @@ async function get_emails(access_token, mailbox) {
         throw new Error("Failed to obtain access token");
     }
 
-    const response = await fetch(`https://microsoft.com{mailbox}/messages?$top=100`, {
+    const response = await fetchWithRetry(`https://microsoft.com{mailbox}/messages?$top=50`, {
         method: 'GET',
         headers: {
-            'Content-Type': 'application/json',
-            "Authorization": `Bearer ${access_token}`
-        },
+            'Accept': 'application/json',
+            'Authorization': `Bearer ${access_token}`
+        }
     });
 
     if (!response.ok) {
@@ -95,61 +95,47 @@ async function get_emails(access_token, mailbox) {
     const responseData = await response.json();
     const emails = responseData.value || [];
 
-    return emails.map(item => {
-        return {
-            send: item.from?.emailAddress?.address || '未知发件人',
-            subject: item.subject || '(无主题)',
-            text: item.bodyPreview || '',
-            html: item.body?.content || item.bodyPreview || '',
-            date: item.createdDateTime || '',
-        };
-    });
+    return emails.map(item => ({
+        send: item.from?.emailAddress?.address || '未知发件人',
+        subject: item.subject || '(无主题)',
+        text: item.bodyPreview || '',
+        html: item.body?.content || item.bodyPreview || '',
+        date: item.createdDateTime || '',
+    }));
 }
 
 module.exports = async (req, res) => {
-
     const { password } = req.method === 'GET' ? req.query : req.body;
-
     const expectedPassword = process.env.PASSWORD;
 
     if (password !== expectedPassword && expectedPassword) {
-        return res.status(401).json({
-            error: '密码验证失败'
-        });
+        return res.status(401).json({ error: '密码验证失败' });
     }
 
     let { refresh_token, client_id, email, mailbox } = req.method === 'GET' ? req.query : req.body;
 
     if (!refresh_token || !client_id || !email || !mailbox) {
-        return res.status(400).json({ error: 'Missing required parameters: refresh_token, client_id, email, or mailbox' });
+        return res.status(400).json({ error: 'Missing required parameters' });
     }
 
     const ALLOWED_MAILBOXES = ['INBOX', 'Junk'];
     if (!ALLOWED_MAILBOXES.includes(mailbox)) {
-        return res.status(400).json({ error: 'Invalid mailbox. Allowed: INBOX, Junk' });
+        return res.status(400).json({ error: 'Invalid mailbox' });
     }
 
     try {
-        console.log("判断是否graph_api");
         const graph_api_result = await graph_api(refresh_token, client_id);
 
         if (graph_api_result.status) {
-            console.log("尝试使用 graph_api 取件");
-
-            let targetMailbox = 'inbox';
-            if (mailbox === 'Junk') {
-                targetMailbox = 'junkemail';
-            }
-
+            const targetMailbox = mailbox === 'Junk' ? 'junkemail' : 'inbox';
             try {
                 const result = await get_emails(graph_api_result.access_token, targetMailbox);
                 return res.status(200).json(result);
             } catch (graphErr) {
-                console.log("Graph API 失败，自动切换为 IMAP 兜底模式:", graphErr.message);
+                console.log("Graph 切换 IMAP:", graphErr.message);
             }
         }
 
-        console.log("使用 IMAP 模式取件");
         const access_token = await get_access_token(refresh_token, client_id);
         const authString = generateAuthString(email, access_token);
 
@@ -159,26 +145,20 @@ module.exports = async (req, res) => {
             host: '://office365.com',
             port: 993,
             tls: true,
-            tlsOptions: {
-                rejectUnauthorized: false
-            }
+            connTimeout: 15000,
+            authTimeout: 15000,
+            tlsOptions: { rejectUnauthorized: false }
         });
 
         const emailList = [];
         imap.once("ready", async () => {
             try {
                 await new Promise((resolve, reject) => {
-                    imap.openBox(mailbox, true, (err, box) => {
-                        if (err) return reject(err);
-                        resolve(box);
-                    });
+                    imap.openBox(mailbox, true, (err, box) => err ? reject(err) : resolve(box));
                 });
 
                 const results = await new Promise((resolve, reject) => {
-                    imap.search(["ALL"], (err, results) => {
-                        if (err) return reject(err);
-                        resolve(results);
-                    });
+                    imap.search(["ALL"], (err, results) => err ? reject(err) : resolve(results));
                 });
 
                 if (!results || results.length === 0) {
@@ -186,56 +166,42 @@ module.exports = async (req, res) => {
                     return;
                 }
 
-                const f = imap.fetch(results, { bodies: "" });
+                const recentResults = results.slice(-50);
+                const f = imap.fetch(recentResults, { bodies: "" });
 
-                f.on("message", (msg, seqno) => {
-                    msg.on("body", (stream, info) => {
+                f.on("message", (msg) => {
+                    msg.on("body", (stream) => {
                         simpleParser(stream, (err, mail) => {
                             if (err) return;
-                            const data = {
+                            emailList.push({
                                 send: mail.from?.text || '未知发件人',
                                 subject: mail.subject || '(无主题)',
                                 text: mail.text || '',
                                 html: mail.html || '',
                                 date: mail.date || '',
-                            };
-
-                            emailList.push(data);
+                            });
                         });
                     });
                 });
 
-                f.once("end", () => {
-                    imap.end();
-                });
+                f.once("end", () => imap.end());
             } catch (err) {
                 imap.end();
-                if (!res.headersSent) {
-                    res.status(500).json({ error: err.message });
-                }
+                if (!res.headersSent) res.status(500).json({ error: err.message });
             }
         });
 
         imap.once('error', (err) => {
-            console.error('IMAP error:', err);
-            if (!res.headersSent) {
-                res.status(500).json({ error: err.message });
-            }
+            if (!res.headersSent) res.status(500).json({ error: `IMAP error: ${err.message}` });
         });
 
         imap.once('end', () => {
-            if (!res.headersSent) {
-                res.status(200).json(emailList);
-            }
-            console.log('IMAP connection ended');
+            if (!res.headersSent) res.status(200).json(emailList);
         });
 
         imap.connect();
 
     } catch (error) {
-        console.error('Error:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ error: error.message });
-        }
+        if (!res.headersSent) res.status(500).json({ error: error.message });
     }
 };
